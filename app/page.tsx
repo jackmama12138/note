@@ -6,9 +6,18 @@ import { Input } from "@/components/ui/input";
 import { Search, Plus, FileText, Image, Link, Clock, FolderOpen, X, DownloadCloud } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { AuthForm } from "@/components/auth/auth-form";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
+import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
+import NoteCard from "@/components/notes/NoteCard";
+import NewNoteDialog from "@/components/modals/NewNoteDialog";
+import ImagePreviewDialog from "@/components/modals/ImagePreviewDialog";
+import TxtEditDialog from "@/components/modals/TxtEditDialog";
+import DeleteConfirmationDialog from "@/components/modals/DeleteConfirmationDialog";
+import { Toaster } from "@/components/ui/toaster";
+
+// Import server actions
+import { createNoteServer, updateNoteServer, fetchNotesServer, deleteNoteServer, deleteAttachmentServer, saveTxtServer, uploadFileServer } from "@/app/actions";
 
 export default function Home() {
   const [selectedTab, setSelectedTab] = useState("all");
@@ -87,10 +96,8 @@ export default function Home() {
   }, []);
 
   const fetchNotes = async () => {
-    const { data, error } = await supabase
-      .from("notes")
-      .select("*")
-      .order("updated_at", { ascending: false });
+    // Use server action to fetch notes
+    const { data, error } = await fetchNotesServer();
 
     if (error) {
       console.error("Error fetching notes:", error);
@@ -105,99 +112,53 @@ export default function Home() {
     setNotes(data || []);
   };
 
-  const handleCreateNote = async () => {
-    console.log('handleCreateNote called', newNote);
-    if (!newNote.content && attachments.length === 0) {
-      // 内容和附件都为空才提示
-      console.log('内容和附件都为空，toast 应该弹出');
-      toast({
-        title: "错误",
-        description: "内容和附件不能同时为空",
-        variant: "destructive",
-      });
-      return;
-    }
-    // 如果标题为空，自动用内容前20字或第一个附件名作为标题
-    let noteTitle = newNote.title.trim();
-    if (!noteTitle) {
-      if (newNote.content) {
-        noteTitle = newNote.content.slice(0, 20);
-      } else if (attachments.length > 0) {
-        noteTitle = attachments[0].name;
-      }
-    }
-    const { error } = await supabase.from("notes").insert([
-      {
-        title: noteTitle,
-        content: newNote.content,
-        user_id: session.user.id,
-        attachments,
-      },
-    ]);
-
-    if (error) {
-      toast({
-        title: "错误",
-        description: "创建笔记失败",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    toast({
-      title: "成功",
-      description: "笔记已创建",
-    });
-    
-    setNewNote({ title: "", content: "" });
-    setIsNewNoteOpen(false);
-    fetchNotes();
-  };
-
-  // 上传文件到 Supabase Storage
+  // Upload file to Supabase Storage - Now uses server action
   const handleFileUpload = async (file: File) => {
     console.log('handleFileUpload called', file);
-    const fileExt = file.name.split('.').pop();
-    const filePath = `${session.user.id}/${Date.now()}.${fileExt}`;
-    const { data, error } = await supabase.storage.from('note').upload(filePath, file);
-    if (error) {
-      console.log('上传失败', error);
+
+    const formData = new FormData();
+    formData.append('file', file);
+    // The file path construction will now happen on the server for security
+    formData.append('filePath', file.name); // Pass original file name, server will add user ID
+
+    // Call the server action to upload the file
+    const result = await uploadFileServer(formData);
+
+    if (result.error) {
+      console.error('上传失败', result.error);
       toast({
         title: "上传失败",
-        description: error.message,
+        description: result.error,
         variant: "destructive",
       });
       return;
     }
-    // 获取公开URL
-    const { data: publicUrlData } = supabase.storage.from('note').getPublicUrl(filePath);
-    const url = publicUrlData?.publicUrl;
-    if (url) {
-      // 新附件对象，type 字段为真实类型
-      const attachment = {
-        name: file.name,
-        type: file.type, // 真实类型，如 image/png、text/plain、application/pdf
-        url,
-        size: file.size,
-        filePath,
-      };
-      setAttachments((prev) => [...prev, attachment]);
-      toast({ title: "上传成功", description: file.name });
-      console.log('上传成功', url);
-    } else {
-      console.log('获取公开URL失败', publicUrlData);
+
+    // If upload is successful, add the returned file metadata to attachments state
+    if (result.data) {
+       setAttachments((prev) => [...prev, result.data]);
+       toast({ title: "上传成功", description: file.name });
+       console.log('上传成功', result.data.url);
     }
   };
 
-  // 删除附件
+  // 删除附件 - Now uses server action
   const handleDeleteAttachment = async (filePath: string) => {
-    const { error } = await supabase.storage.from('note').remove([filePath]);
-    if (error) {
-      toast({ title: "删除失败", description: error.message, variant: "destructive" });
+    // Call the server action to delete the attachment
+    const result = await deleteAttachmentServer(filePath);
+
+    if (result.error) {
+      toast({ title: "删除失败", description: result.error, variant: "destructive" });
       return;
     }
+
+    // Update state client-side for immediate feedback
     setAttachments((prev) => prev.filter(att => att.filePath !== filePath));
     toast({ title: "已删除" });
+
+    // Consider refetching notes or updating the specific note's attachments in state
+    // Refetching all notes for now for simplicity:
+     fetchNotes();
   };
 
   // 处理拖拽
@@ -210,45 +171,85 @@ export default function Home() {
   };
 
   // 处理粘贴
-  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  // const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  //   const items = e.clipboardData.items;
+  //   let foundFile = false;
+  //   for (let i = 0; i < items.length; i++) {
+  //     const item = items[i];
+  //     if (item.kind === 'file') {
+  //       const file = item.getAsFile();
+  //       if (file) {
+  //         handleFileUpload(file);
+  //         foundFile = true;
+  //       }
+  //     } else if (item.kind === 'string' && item.type === 'text/plain') {
+  //       // Optionally handle pasting text
+  //       item.getAsString(text => {
+  //         // You might want to insert text at the cursor position
+  //         const textarea = contentInputRef.current;
+  //         if (textarea) {
+  //           const start = textarea.selectionStart;
+  //           const end = textarea.selectionEnd;
+  //           const newText = textarea.value.substring(0, start) + text + textarea.value.substring(end);
+  //           setNewNote({ ...newNote, content: newText });
+  //           // Restore cursor position
+  //           // textarea.selectionStart = textarea.selectionEnd = start + text.length;
+  //         }
+  //       });
+  //     }
+  //   }
+  //   if (foundFile) {
+  //     e.preventDefault(); // Prevent default paste behavior for files
+  //   }
+  // };
+  //处理粘贴2
+  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
-    let foundFile = false;
+    let hasFile = false;
+  
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+  
       if (item.kind === 'file') {
         const file = item.getAsFile();
         if (file) {
-          handleFileUpload(file);
-          foundFile = true;
+          await handleFileUpload(file);  // 无论是图片还是附件，都统一上传
+          hasFile = true;
         }
       }
     }
-    if (foundFile) {
-      e.preventDefault(); // 阻止默认粘贴行为
+  
+    // ❗只有当粘贴内容中包含文件（图片、PDF等）时才阻止默认行为，避免 base64 粘贴
+    if (hasFile) {
+      e.preventDefault();
     }
   };
-
+  
+  
   // 读取 txt 文件内容（加时间戳避免缓存）
   const fetchTxtContent = async (url: string) => {
     const res = await fetch(url + '?t=' + Date.now());
     return await res.text();
   };
 
-  // 保存 txt 编辑
+  // 保存 txt 编辑 - Now uses server action
   const handleSaveTxt = async () => {
     if (!editTxt) return;
-    const blob = new Blob([editTxt.content], { type: editTxt.att.type });
-    // 覆盖上传
-    const { error } = await supabase.storage.from('note').upload(editTxt.att.filePath, blob, { upsert: true });
-    if (error) {
-      toast({ title: "保存失败", description: error.message, variant: "destructive" });
+
+    // Call the server action to save the text content
+    const result = await saveTxtServer(editTxt.att.filePath, editTxt.content, editTxt.att.type);
+
+    if (result.error) {
+      toast({ title: "保存失败", description: result.error, variant: "destructive" });
       return;
     }
-    // 保存后强制刷新内容
-    // const newContent = await fetchTxtContent(editTxt.att.url);
-    // setEditTxt({ ...editTxt, content: newContent });
+
+    // Saving successful
     toast({ title: "已保存" });
-    setEditTxt(null); // 自动关闭弹窗
+    setEditTxt(null); // Automatic close dialog
+
+    // Consider refetching notes or updating state immutably if txt content is displayed in the card
+    fetchNotes(); // Refetch notes to ensure latest data is shown
   };
 
   // 编辑时初始化表单
@@ -347,37 +348,43 @@ export default function Home() {
     fetchNotes();
   };
 
-  // 删除笔记
+  // Delete note - Now uses server action
   const handleDeleteNote = async (noteId: number) => {
-    // 先查找该笔记的附件，删除 storage 文件
-    const note = notes.find(n => n.id === noteId);
-    let attachmentsArr: any[] = [];
-    try {
-      attachmentsArr = Array.isArray(note.attachments) ? note.attachments : JSON.parse(note.attachments || '[]');
-    } catch { attachmentsArr = []; }
-    for (const att of attachmentsArr) {
-      if (att.filePath) {
-        await supabase.storage.from('note').remove([att.filePath]);
-      }
+    // Delete the note using server action
+    const result = await deleteNoteServer(noteId);
+
+    if (result.error) {
+      toast({ title: "删除失败", description: result.error, variant: "destructive" });
+      return;
     }
-    // 删除笔记
-    await supabase.from('notes').delete().eq('id', noteId);
+
     toast({ title: '已删除' });
     setDeleteNoteId(null);
-    fetchNotes();
+    fetchNotes(); // Refetch notes after deletion
   };
 
   // 强制下载函数
   const handleDownload = async (url: string, name: string) => {
-    const res = await fetch(url);
-    const blob = await res.blob();
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = name;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(link.href);
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Download failed');
+      const blob = await res.blob();
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    } catch (error: any) {
+      toast({ title: "下载失败", description: error.message, variant: "destructive" });
+    }
+  };
+
+  // 退出登录
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    window.location.reload();
   };
 
   const sidebarItems = [
@@ -391,7 +398,9 @@ export default function Home() {
   if (!session) {
     return (
       <div className="h-screen flex items-center justify-center">
+        <Toaster />
         <AuthForm />
+      
       </div>
     );
   }
@@ -415,8 +424,8 @@ export default function Home() {
   return (
     <div className="flex h-screen bg-background">
       {/* Left Sidebar */}
-      <div className="w-64 border-r bg-card p-4">
-        <div className="mb-6">
+      <div className="w-64 border-r bg-card p-4 flex flex-col justify-between">
+        <div>
           <Button 
             className="w-full mb-4" 
             size="lg"
@@ -429,7 +438,7 @@ export default function Home() {
           >
             <Plus className="mr-2 h-4 w-4" /> 新建笔记
           </Button>
-          <div className="relative">
+          <div className="relative mb-6">
             <Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
             <Input
               className="pl-9"
@@ -438,319 +447,106 @@ export default function Home() {
               onChange={(e) => setSearchQuery(e.target.value)}
             />
           </div>
+          <nav>
+            {sidebarItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setSelectedTab(item.id)}
+                className={`flex items-center w-full p-2 rounded-lg mb-1 transition-colors font-medium text-sm ${
+                  selectedTab === item.id
+                    ? "bg-primary text-primary-foreground shadow"
+                    : "hover:bg-secondary text-foreground"
+                }`}
+              >
+                <item.icon className="h-5 w-5 mr-3" />
+                {item.label}
+              </button>
+            ))}
+          </nav>
         </div>
-        
-        <nav>
-          {sidebarItems.map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setSelectedTab(item.id)}
-              className={`flex items-center w-full p-2 rounded-lg mb-1 ${
-                selectedTab === item.id
-                  ? "bg-primary text-primary-foreground"
-                  : "hover:bg-secondary"
-              }`}
-            >
-              <item.icon className="h-5 w-5 mr-3" />
-              {item.label}
-            </button>
-          ))}
-        </nav>
+        {/* 用户信息和退出登录 */}
+        <div className="flex flex-col items-center gap-2 mt-8 p-2 border-t pt-4">
+          <Avatar>
+            <AvatarImage src={session.user?.user_metadata?.avatar_url || undefined} alt={session.user?.email || "用户"} />
+            <AvatarFallback>{session.user?.email?.[0]?.toUpperCase() || "U"}</AvatarFallback>
+          </Avatar>
+          <div className="text-xs text-muted-foreground truncate max-w-[150px]">{session.user?.email}</div>
+          <Button variant="outline" size="sm" className="w-full mt-2" onClick={handleLogout}>
+            退出登录
+          </Button>
+        </div>
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 p-6">
+      <div className="flex-1 p-6 flex flex-col h-screen overflow-hidden">
         <h2 className="text-2xl font-semibold mb-6">
           {sidebarItems.find((item) => item.id === selectedTab)?.label}
         </h2>
-        <div className="grid gap-4">
-          {filteredNotes.map((note) => {
-            let attachmentsArr: any[] = [];
-            try {
-              attachmentsArr = Array.isArray(note.attachments) ? note.attachments : JSON.parse(note.attachments || '[]');
-            } catch { attachmentsArr = []; }
-            const firstAtt = attachmentsArr[0];
-            return (
-              <div
-                key={note.id}
-                className="p-4 rounded-lg border bg-card hover:shadow-md transition-shadow cursor-pointer flex gap-4 items-center relative"
-                onDoubleClick={() => openEditDialog(note)}
-              >
-                {/* 删除按钮 */}
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="absolute right-2 top-2 z-10 bg-white/80 hover:bg-red-500 hover:text-white shadow-md border border-red-200 transition-colors"
-                  style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }}
-                  onClick={e => { e.stopPropagation(); setDeleteNoteId(note.id); }}
-                  title="删除笔记"
-                >
-                  <X className="w-4 h-4" />
-                </Button>
-                {/* 下载按钮（如果有附件） */}
-                {firstAtt && (
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="rounded-full bg-white/80 hover:bg-blue-500 hover:text-white shadow border border-blue-200 transition-colors absolute right-12 top-2"
-                    style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }}
-                    title="下载附件"
-                    onClick={e => {
-                      e.stopPropagation();
-                      handleDownload(firstAtt.url, firstAtt.name);
-                    }}
-                  >
-                    <DownloadCloud className="w-4 h-4" />
-                  </Button>
-                )}
-                {/* 附件缩略图/图标区（首页） */}
-                {attachmentsArr.length > 0 && (
-                  <div className="flex flex-wrap gap-2 items-center">
-                    {attachmentsArr.slice(0, 7).map((att: any) => (
-                      att.type && att.type.startsWith('image/') ? (
-                        <img key={att.url} src={att.url} alt={att.name} className="w-10 h-10 object-cover rounded" />
-                      ) : att.type === 'text/plain' ? (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-yellow-400/80 rounded text-white text-xs font-bold">TXT</span>
-                      ) : att.type === 'link' ? (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-blue-400/80 rounded text-white text-xs font-bold">LINK</span>
-                      ) : (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-secondary rounded text-xs text-gray-600 font-bold">{att.name.split('.').pop()?.toUpperCase()}</span>
-                      )
-                    ))}
-                    {attachmentsArr.length > 7 && !showAllNoteAttachments?.[note.id] && (
-                      <button
-                        className="w-10 h-10 flex items-center justify-center rounded-full bg-gray-200 text-gray-600 font-bold text-base border border-gray-300 hover:bg-gray-300 transition"
-                        onClick={e => { e.stopPropagation(); setShowAllNoteAttachments({ ...showAllNoteAttachments, [note.id]: true }); }}
-                      >
-                        +{attachmentsArr.length - 7}
-                      </button>
-                    )}
-                    {attachmentsArr.length > 7 && showAllNoteAttachments?.[note.id] && (
-                      <button
-                        className="w-10 h-10 flex items-center justify-center rounded-full bg-gray-200 text-gray-600 font-bold text-base border border-gray-300 hover:bg-gray-300 transition"
-                        onClick={e => { e.stopPropagation(); setShowAllNoteAttachments({ ...showAllNoteAttachments, [note.id]: false }); }}
-                      >
-                        收起
-                      </button>
-                    )}
-                    {attachmentsArr.length > 7 && showAllNoteAttachments?.[note.id] && attachmentsArr.slice(7).map((att: any) => (
-                      att.type && att.type.startsWith('image/') ? (
-                        <img key={att.url} src={att.url} alt={att.name} className="w-10 h-10 object-cover rounded" />
-                      ) : att.type === 'text/plain' ? (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-yellow-400/80 rounded text-white text-xs font-bold">TXT</span>
-                      ) : att.type === 'link' ? (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-blue-400/80 rounded text-white text-xs font-bold">LINK</span>
-                      ) : (
-                        <span key={att.url} className="w-10 h-10 flex items-center justify-center bg-secondary rounded text-xs text-gray-600 font-bold">{att.name.split('.').pop()?.toUpperCase()}</span>
-                      )
-                    ))}
-                  </div>
-                )}
-                <div className="flex-1 min-w-0">
-                  <div className="flex justify-between items-start mb-2">
-                    <h3 className="font-medium truncate">{note.title}</h3>
-                    <span className="text-sm text-muted-foreground">
-                      {new Date(note.updated_at).toLocaleDateString()}
-                    </span>
-                  </div>
-                  <p className="text-sm text-muted-foreground line-clamp-2">
-                    {renderContentWithLinks(note.content)}
-                  </p>
-                </div>
-              </div>
-            );
-          })}
+        {/* 更改了 */}
+        {/* <div className="grid gap-4 overflow-y-auto flex-1 pr-2 mx-auto w-full"> */}
+        <div className="flex flex-col gap-4 overflow-y-auto flex-1 pr-2 mx-auto w-full">
+          {filteredNotes.map((note) => (
+            <NoteCard
+              key={note.id}
+              note={note}
+              openEditDialog={openEditDialog}
+              setDeleteNoteId={setDeleteNoteId}
+              handleDownload={handleDownload}
+              setPreviewImg={setPreviewImg}
+              renderContentWithLinks={renderContentWithLinks}
+              handleDeleteAttachment={handleDeleteAttachment}
+            />
+          ))}
         </div>
       </div>
 
-      {/* New Note Dialog */}
-      <Dialog open={isNewNoteOpen} onOpenChange={(open) => {
-        setIsNewNoteOpen(open);
-        if (!open) {
-          setEditNote(null);
-          setNewNote({ title: '', content: '' });
-          setAttachments([]);
-        } else {
-          // 打开时内容输入框自动获取焦点
-          setTimeout(() => {
-            contentInputRef.current?.focus();
-          }, 100);
-        }
-      }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{editNote ? '编辑笔记' : '新建笔记'}</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Input
-                placeholder="标题"
-                value={newNote.title}
-                onChange={(e) => setNewNote({ ...newNote, title: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              {/* 拖拽/粘贴上传区域 */}
-              <div
-                className="border-2 border-dashed rounded-md p-4 text-center cursor-pointer hover:bg-secondary mb-2"
-                onDrop={handleDrop}
-                onDragOver={(e) => e.preventDefault()}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                拖拽或点击上传图片/附件，粘贴图片也可自动上传
-                <input
-                  type="file"
-                  multiple
-                  ref={fileInputRef}
-                  style={{ display: 'none' }}
-                  onChange={(e) => {
-                    if (e.target.files) {
-                      Array.from(e.target.files).forEach(handleFileUpload);
-                    }
-                  }}
-                />
-              </div>
-              {/* 附件展示区（编辑弹窗） */}
-              {attachments.length > 0 && (
-                <div className="flex flex-wrap gap-3 mb-2 items-center">
-                  {(showAllAttachments ? attachments : attachments.slice(0, 7)).map((att: any) => (
-                    <div key={att.url} className="border rounded p-2 flex items-center gap-2 bg-muted relative" style={{ minWidth: 120 }}>
-                      {att.type.startsWith('image/') ? (
-                        <>
-                          <img src={att.url} alt={att.name} className="w-16 h-16 object-cover rounded cursor-pointer" onClick={e => { e.stopPropagation(); setPreviewImg(att.url); }} />
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="rounded-full bg-white/80 hover:bg-blue-500 hover:text-white shadow border border-blue-200 transition-colors absolute right-2 top-2"
-                            style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }}
-                            title="下载"
-                            onClick={e => { e.stopPropagation(); handleDownload(att.url, att.name); }}
-                          >
-                            <DownloadCloud className="w-4 h-4" />
-                          </Button>
-                        </>
-                      ) : att.type === 'text/plain' ? (
-                        <>
-                          <span className="w-10 h-10 flex items-center justify-center bg-secondary rounded text-xs cursor-pointer" onClick={async (e) => { e.preventDefault(); setEditTxt({ att, content: await fetchTxtContent(att.url) }); }}>{att.name.split('.').pop()?.toUpperCase()}</span>
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="rounded-full bg-white/80 hover:bg-blue-500 hover:text-white shadow border border-blue-200 transition-colors absolute right-2 top-2"
-                            style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }}
-                            title="下载"
-                            onClick={e => { e.stopPropagation(); handleDownload(att.url, att.name); }}
-                          >
-                            <DownloadCloud className="w-4 h-4" />
-                          </Button>
-                        </>
-                      ) : (
-                        <>
-                          <span className="w-10 h-10 flex items-center justify-center bg-secondary rounded text-xs">{att.name.split('.').pop()?.toUpperCase()}</span>
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="rounded-full bg-white/80 hover:bg-blue-500 hover:text-white shadow border border-blue-200 transition-colors absolute right-2 top-2"
-                            style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.08)' }}
-                            title="下载"
-                            onClick={e => { e.stopPropagation(); handleDownload(att.url, att.name); }}
-                          >
-                            <DownloadCloud className="w-4 h-4" />
-                          </Button>
-                        </>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="truncate font-medium">{att.name}</div>
-                        <div className="text-xs text-muted-foreground">{(att.size/1024).toFixed(1)} KB</div>
-                      </div>
-                      <Button size="icon" variant="ghost" onClick={() => handleDeleteAttachment(att.filePath)} title="删除">
-                        <span className="text-red-500">✕</span>
-                      </Button>
-                    </div>
-                  ))}
-                  {attachments.length > 7 && !showAllAttachments && (
-                    <button
-                      className="w-16 h-16 flex items-center justify-center rounded-full bg-gray-200 text-gray-600 font-bold text-lg border border-gray-300 hover:bg-gray-300 transition"
-                      onClick={() => setShowAllAttachments(true)}
-                    >
-                      +{attachments.length - 7}
-                    </button>
-                  )}
-                  {showAllAttachments && (
-                    <button
-                      className="w-16 h-16 flex items-center justify-center rounded-full bg-gray-200 text-gray-600 font-bold text-lg border border-gray-300 hover:bg-gray-300 transition"
-                      onClick={() => setShowAllAttachments(false)}
-                    >
-                      收起
-                    </button>
-                  )}
-                </div>
-              )}
-              <Textarea
-                placeholder="内容"
-                value={newNote.content}
-                onChange={(e) => setNewNote({ ...newNote, content: e.target.value })}
-                className="min-h-[200px]"
-                onPaste={handlePaste}
-                ref={contentInputRef}
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => {
-              setIsNewNoteOpen(false);
-              setEditNote(null);
-              setNewNote({ title: '', content: '' });
-              setAttachments([]);
-            }}>
-              取消
-            </Button>
-            <Button onClick={handleSaveNote}>
-              {editNote ? '保存修改' : '创建'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* New/Edit Note Dialog */}
+      <NewNoteDialog
+        isOpen={isNewNoteOpen}
+        setIsOpen={setIsNewNoteOpen}
+        newNote={newNote}
+        setNewNote={setNewNote}
+        attachments={attachments}
+        setAttachments={setAttachments}
+        editNote={editNote}
+        setEditNote={setEditNote}
+        handleSaveNote={handleSaveNote}
+        handleFileUpload={handleFileUpload}
+        handleDeleteAttachment={handleDeleteAttachment}
+        handleDrop={handleDrop}
+        handlePaste={handlePaste}
+        fetchTxtContent={fetchTxtContent}
+        handleSaveTxt={handleSaveTxt}
+        fileInputRef={fileInputRef}
+        contentInputRef={contentInputRef}
+        toast={toast}
+        setPreviewImg={setPreviewImg}
+        setEditTxt={setEditTxt}
+        handleDownload={handleDownload}
+      />
 
-      {/* 图片预览 Dialog */}
-      <Dialog open={!!previewImg} onOpenChange={() => setPreviewImg(null)}>
-        <DialogContent className="flex flex-col items-center justify-center">
-          <DialogHeader>
-            <DialogTitle>图片预览</DialogTitle>
-          </DialogHeader>
-          {previewImg && <img src={previewImg} alt="预览" className="max-w-full max-h-[70vh] rounded" />}
-        </DialogContent>
-      </Dialog>
+      {/* Image Preview Dialog */}
+      <ImagePreviewDialog
+        previewImg={previewImg}
+        setPreviewImg={setPreviewImg}
+      />
+
       {/* txt 编辑 Dialog */}
-      <Dialog open={!!editTxt} onOpenChange={() => setEditTxt(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>编辑文本文件：{editTxt?.att.name}</DialogTitle>
-          </DialogHeader>
-          <Textarea
-            className="min-h-[200px]"
-            value={editTxt?.content || ''}
-            onChange={e => setEditTxt(editTxt ? { ...editTxt, content: e.target.value } : null)}
-          />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setEditTxt(null)}>取消</Button>
-            <Button onClick={handleSaveTxt}>保存</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <TxtEditDialog
+        editTxt={editTxt}
+        setEditTxt={setEditTxt}
+        handleSaveTxt={handleSaveTxt}
+      />
 
       {/* 删除笔记确认 Dialog */}
-      <Dialog open={!!deleteNoteId} onOpenChange={() => setDeleteNoteId(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>确认删除</DialogTitle>
-          </DialogHeader>
-          <div className="py-4">确定要删除这条笔记吗？相关附件也会被一并删除。</div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteNoteId(null)}>取消</Button>
-            <Button variant="destructive" onClick={() => deleteNoteId && handleDeleteNote(deleteNoteId)}>删除</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <DeleteConfirmationDialog
+        deleteNoteId={deleteNoteId}
+        setDeleteNoteId={setDeleteNoteId}
+        handleDeleteNote={handleDeleteNote}
+      />
+
+      {/* Add the Toaster component here */}
+      <Toaster />
     </div>
   );
 }
